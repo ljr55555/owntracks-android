@@ -18,8 +18,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.stream.Collectors
 import javax.net.ssl.SSLHandshakeException
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.DurationUnit
+import kotlin.time.TimeSource
 import kotlin.time.measureTime
 import kotlin.time.measureTimedValue
 import kotlin.time.toDuration
@@ -33,6 +35,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.SerializationException
 import org.eclipse.paho.client.mqttv3.IMqttActionListener
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
@@ -42,6 +45,7 @@ import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
 import org.eclipse.paho.client.mqttv3.MqttException
 import org.eclipse.paho.client.mqttv3.MqttException.REASON_CODE_CLIENT_ALREADY_DISCONNECTED
 import org.eclipse.paho.client.mqttv3.MqttException.REASON_CODE_CLIENT_EXCEPTION
+import org.eclipse.paho.client.mqttv3.MqttException.REASON_CODE_CLIENT_TIMEOUT
 import org.eclipse.paho.client.mqttv3.MqttException.REASON_CODE_CONNECTION_LOST
 import org.eclipse.paho.client.mqttv3.MqttException.REASON_CODE_SERVER_CONNECT_ERROR
 import org.eclipse.paho.client.mqttv3.MqttMessage
@@ -190,10 +194,19 @@ class MQTTMessageProcessorEndpoint(
 
   override suspend fun sendMessage(message: MessageBase): Result<Unit> {
     Timber.d("Sending message $message")
+    /*
+    Both of these are the state the app is in when the outgoing queue is growing without bound, so
+    each one asks for a reconnect. The request is cheap and self-limiting — the scheduler leaves an
+    attempt that is already pending alone — and without it a reconnect chain that has been broken
+    (a worker cancelled, a callback missed) is never picked up again by the one part of the app
+    that can actually see the messages piling up.
+     */
     if (mqttClientAndConfiguration == null) {
+      scheduler.scheduleMqttReconnect()
       return Result.failure(NotReadyException())
     }
     if (endpointStateRepo.endpointState.value != EndpointState.CONNECTED) {
+      scheduler.scheduleMqttReconnect()
       return Result.failure(NotConnectedException())
     }
     // Updates the message data + metadata with things that are in our preferences
@@ -210,8 +223,17 @@ class MQTTMessageProcessorEndpoint(
               try {
                 Timber.d("Publishing message $message")
                 measureTime {
+                      // Bounded: a link that has gone away without telling us leaves the in-flight
+                      // window permanently full, and an unbounded wait here parks the one loop
+                      // that drains the outgoing queue forever.
+                      val inFlightDeadline = TimeSource.Monotonic.markNow() + IN_FLIGHT_WAIT_TIMEOUT
                       while (mqttClient.inFlightMessageCount >=
                           mqttConnectionConfiguration.maxInFlight) {
+                        if (inFlightDeadline.hasPassedNow()) {
+                          scheduler.scheduleMqttReconnect()
+                          throw InFlightWindowStalledException(
+                              "In-flight window still full after $IN_FLIGHT_WAIT_TIMEOUT")
+                        }
                         Timber.v("Pausing to wait for inflight to drop below max")
                         delay(100.milliseconds)
                       }
@@ -351,6 +373,17 @@ class MQTTMessageProcessorEndpoint(
         Timber.v("MQTT connect to Broker")
         measureTimedValue {
               endpointStateRepo.setState(EndpointState.CONNECTING)
+              /*
+              waitForCompletion() with no argument waits forever. Paho applies the configured
+              connection timeout to the TCP connect, but not to a peer that accepts the connection
+              and then never finishes the MQTT (or WebSocket) handshake — exactly what a reverse
+              proxy does when it is up but its backend is not. Because this runs while holding
+              connectingLock, a wait that never returns doesn't merely fail this attempt: it blocks
+              every future reconnect for the life of the process, which is why the only cure is
+              killing the app.
+               */
+              val completionTimeout =
+                  (mqttConnectionConfiguration.timeout * 2).coerceAtLeast(MIN_COMPLETION_TIMEOUT)
               try {
                 val executorService = ScheduledThreadPoolExecutor(8)
                 val pingSender =
@@ -379,7 +412,9 @@ class MQTTMessageProcessorEndpoint(
                             Timber.d(
                                 "Connecting to ${mqttConnectionConfiguration.connectionString} timeout = ${ it.connectionTimeout.toDuration(DurationUnit.SECONDS)}")
                           }
-                          .run { connect(this).waitForCompletion() }
+                          .run {
+                            connect(this).waitForCompletion(completionTimeout.inWholeMilliseconds)
+                          }
                       pingAlarmReceiver = MQTTPingAlarmReceiver(this)
                       ContextCompat.registerReceiver(
                               applicationContext,
@@ -399,7 +434,7 @@ class MQTTMessageProcessorEndpoint(
                               IntArray(mqttConnectionConfiguration.topicsToSubscribeTo.size) {
                                 mqttConnectionConfiguration.subQos.value
                               })
-                          .waitForCompletion()
+                          .waitForCompletion(completionTimeout.inWholeMilliseconds)
                       Timber.d("MQTT Subscribed")
 
                       messageProcessor.notifyOutgoingMessageQueue()
@@ -414,6 +449,9 @@ class MQTTMessageProcessorEndpoint(
                 when (e) {
                   is MqttException -> {
                     when (e.reasonCode) {
+                      REASON_CODE_CLIENT_TIMEOUT.toInt() ->
+                          Timber.w(
+                              "$errorLog: connection accepted but the handshake did not complete within $completionTimeout")
                       REASON_CODE_CONNECTION_LOST.toInt() ->
                           Timber.w(
                               e.cause,
@@ -462,16 +500,35 @@ class MQTTMessageProcessorEndpoint(
 
   private suspend fun reconnect(
       mqttConnectionConfiguration: MqttConnectionConfiguration
-  ): Result<Unit> =
-      connectingLock.withPermitLogged("MQTT reconnect") {
-        disconnect()
-        try {
-          mqttConnectionIdlingResource.setIdleState(false)
-          connectToBroker(mqttConnectionConfiguration)
-        } finally {
-          mqttConnectionIdlingResource.setIdleState(true)
-        }
+  ): Result<Unit> {
+    /*
+    A bounded acquire rather than withPermit, because the permit is held across calls into the
+    client library and the cost of one of those never returning should be this attempt failing,
+    not every future attempt queueing up behind it forever. Giving up also gets the failure into
+    the log and the reconnect backoff, where an attempt suspended indefinitely on a semaphore is
+    invisible.
+     */
+    if (withTimeoutOrNull(CONNECT_LOCK_TIMEOUT) { connectingLock.acquire() } == null) {
+      Timber.w(
+          "Timed out after $CONNECT_LOCK_TIMEOUT waiting for the MQTT connect lock: a previous " +
+              "attempt has not finished. Scheduling another")
+      scheduler.scheduleMqttReconnect()
+      return Result.failure(ConnectLockTimeoutException())
+    }
+    Timber.v("lock acquired label=MQTT reconnect")
+    return try {
+      disconnect()
+      try {
+        mqttConnectionIdlingResource.setIdleState(false)
+        connectToBroker(mqttConnectionConfiguration)
+      } finally {
+        mqttConnectionIdlingResource.setIdleState(true)
       }
+    } finally {
+      connectingLock.release()
+      Timber.v("lock released label=MQTT reconnect")
+    }
+  }
 
   /**
    * Round-trips an MQTT PINGREQ to establish whether the connection is actually usable, rather than
@@ -511,9 +568,30 @@ class MQTTMessageProcessorEndpoint(
 
   class NotConnectedException : Exception()
 
+  /** The in-flight window never drained, so the link is wedged however connected it claims to be. */
+  class InFlightWindowStalledException(message: String) : Exception(message)
+
+  /** A previous connect attempt is still holding the connect lock. */
+  class ConnectLockTimeoutException : Exception()
+
   companion object {
     /** Bounded so the watchdog cannot be parked indefinitely on an unresponsive broker. */
     private val PING_CHECK_TIMEOUT = 10.seconds
+
+    /**
+     * Floor on how long to wait for CONNACK and SUBACK, for configurations whose connection timeout
+     * is short enough that twice it would be unreasonable on a slow mobile link.
+     */
+    private val MIN_COMPLETION_TIMEOUT = 30.seconds
+
+    /** How long a full in-flight window may stay full before the connection is deemed wedged. */
+    private val IN_FLIGHT_WAIT_TIMEOUT = 1.minutes
+
+    /**
+     * How long to wait for a connect attempt already in progress before abandoning this one.
+     * Comfortably longer than a legitimate connect, which is bounded by [MIN_COMPLETION_TIMEOUT].
+     */
+    private val CONNECT_LOCK_TIMEOUT = 3.minutes
   }
 
   data class MqttClientAndConfiguration(

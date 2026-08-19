@@ -1,6 +1,7 @@
 package org.owntracks.android.services.worker
 
 import android.content.Context
+import android.os.SystemClock
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -13,9 +14,11 @@ import androidx.work.WorkRequest
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import org.owntracks.android.preferences.Preferences
@@ -91,6 +94,12 @@ constructor(
   private val reconnectAttempt = AtomicInteger(0)
 
   /**
+   * When the currently-pending reconnect attempt is due to run, on the elapsed-realtime clock, or
+   * [NO_RECONNECT_PENDING] when nothing is pending.
+   */
+  private val reconnectDueAt = AtomicLong(NO_RECONNECT_PENDING)
+
+  /**
    * Schedules an attempt to reconnect to the MQTT broker.
    *
    * Successive attempts back off exponentially, but never further apart than
@@ -102,9 +111,23 @@ constructor(
    * failures reaches that in well under a day. Combined with Doze deferral on a device that isn't
    * exempt from battery optimisation, retries at that spacing are effectively unbounded and the app
    * never recovers on its own.
+   *
+   * Safe to call from anything that notices the connection is down, however often it fires: an
+   * attempt that is already pending and due sooner is left alone. Without that, a flapping network
+   * or a queue of failing publishes would keep REPLACEing the pending attempt with an ever-later
+   * one and starve the reconnect completely.
    */
   fun scheduleMqttReconnect() {
+    val now = SystemClock.elapsedRealtime()
+    reconnectDueAt.get().let { dueAt ->
+      if (dueAt != NO_RECONNECT_PENDING && now < dueAt) {
+        Timber.v(
+            "MQTT reconnect already pending in ${(dueAt - now).milliseconds}, not rescheduling")
+        return
+      }
+    }
     val delay = reconnectDelayForAttempt(reconnectAttempt.getAndIncrement())
+    reconnectDueAt.set(now + delay.inWholeMilliseconds)
     OneTimeWorkRequest.Builder(MQTTReconnectWorker::class.java)
         // Pause in case there's network turmoil
         .setInitialDelay(delay.inWholeMilliseconds, TimeUnit.MILLISECONDS)
@@ -126,6 +149,10 @@ constructor(
    * run of failures had reached.
    */
   fun resetMqttReconnectBackoff() {
+    reconnectDueAt.set(NO_RECONNECT_PENDING)
+    // A reconnect left pending from the run of failures would otherwise fire and tear down the
+    // connection that has just been established.
+    workManager.cancelUniqueWork(ONETIME_TASK_MQTT_RECONNECT)
     reconnectAttempt.getAndSet(0).run {
       if (this > 0) Timber.d("Reset MQTT reconnect backoff after $this attempts")
     }
@@ -164,6 +191,8 @@ constructor(
 
     /** Enough doublings to comfortably exceed [RECONNECT_MAX_DELAY] without overflowing the shift. */
     private const val MAX_BACKOFF_DOUBLINGS = 16
+
+    private const val NO_RECONNECT_PENDING = Long.MIN_VALUE
   }
 
   override fun onPreferenceChanged(properties: Set<String>) {
